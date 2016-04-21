@@ -1,0 +1,235 @@
+\documentclass{scrartcl}
+\usepackage[utf8]{inputenc}
+\usepackage{natbib}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{amssymb}
+\usepackage{color}
+\usepackage{commath}
+\usepackage{enumerate}
+\usepackage{algpseudocode}
+
+\bibliographystyle{plainnat}  % use the plainnat instead of plain
+
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\minimize}{minimize}
+\DeclareMathOperator*{\prox}{prox}
+\DeclareMathOperator*{\loss}{loss}
+\DeclareMathOperator*{\reg}{reg}
+\def\RR{{\mathbb R}}
+\newcommand{\blue}{\color{blue}}
+
+\newtheorem{example}{Example}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma} 
+\newtheorem{proposition}[theorem]{Proposition} 
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\newtheorem{axiom}[theorem]{Axiom}
+
+\newcommand{\SAGA}{\textsc{Saga}}
+\newcommand{\SAG}{\textsc{Sag}}
+\newcommand{\LASSO}{\textsc{Lasso}}
+
+\title{Large-scale optimization with the \textsc{SAGA} algorithm}
+\author{Fabian Pedregosa \qquad Arnaud Rachez \\\\
+   \emph{Chaire Havas-Dauphine  \'Economie des Nouvelles Donn\'ees} \\
+   \emph{Universit\'e Paris-Dauphine, PSL Research University} \\
+    \emph{INRIA - Sierra project-team}
+}
+\date{\today} % {November 2015}
+
+\begin{document}
+
+\maketitle
+
+
+\begin{abstract}
+In this technical report we describe the implementation of the \SAGA\ algorithm in the lightning\footnote{\url{http://www.mblondel.org/lightning/}} python library. We discuss implementation details such as the use of lazy or lagged updates for squared $\ell_2$ and $\ell_1$ regularization.
+\end{abstract}
+
+\section{Introduction}
+
+A large class of optimization problems in machine learning can be expressed as the minimization of a finite sum of the form
+$$
+\argmin_{x \in \RR^p} \left\{ \sum_{i=1}^n f_i(x) + \lambda \norm{x}^2 + \mu \Omega(x)\right\} \quad,
+$$
+where $\mu, \lambda$ are real constants, each $f_i: \RR^p \to \RR$ is convex and has Lipschitz continuous derivatives with constant $L$. $\Omega: \RR^p \to \RR$ is also assumed to be convex but potentially non-differentiable. We will further assume that we have acces to its proximal operator, denoted $\text{Prox}_{\mu}$.
+
+These problems arise often in machine learning, where the cost function is a misfit over a large number of data points. The \SAGA\ algorithm~\citep{defazio2014saga} is a recently proposed algorithm to solve optimization problems of this type. As other iterative methods, this algorithm creates a sequence of iterates $w_1, w_2, \ldots$ that converge towards the desired solution $x^*$. The updates of \SAGA\ take the form
+\begin{equation} \label{eq:update_rule}
+x_{k+1} = \text{Prox}_{\gamma \mu}((1 - \gamma \lambda)x_k - \gamma (\nabla f_i(x_k) - {\alpha}_i + \bar{\alpha})) \quad,
+\end{equation}
+where $\bar{\alpha} = \sum_{i=1}^n \alpha_i$ and $\alpha_i$ is a table (memory) of historical gradients, $\gamma$ is the step size and $i$ is an index selected uniformly at random. The update rule for the historical gradients is $\alpha_i = f_i(x)$ for the selected $i$. The corrections will be used the next time the same index $i$ gets sampled. The \SAGA\ algorithm is further described in~\citep{defazio2014saga,hofmann2015variance}.
+
+
+We will focus in the case in which the smooth term is linearly-parametrized, that is, $f_i(x)$ is of the form $g(a_i^T x)$ for all $i$. In this setting $\nabla f_i(x) = a_i g'(a_i^T x)$, so since each $a_i$ is constant we only need to store the scalar $g'(a_i^T x)$. This reduces the storage cost from $\mathcal{O}(n p)$ down to $\mathcal{O}(n)$.
+
+The values of $\Omega$ that we will examine are the cases of $\ell_1$-regularization and $\ell_1/\ell_2$-regularization. $\ell_1$ regularization, known as \LASSO\ when the smooth term is a least squares loss, is a popular penalty that is commonly used to promote sparsity within the vector of coefficients. It is denoted $\norm{\cdot}_1$ and defined as the absolute sum of its components, 
+$
+\norm{x}_1 = \sum_{i=1}^p |x_i|
+$. Its proximal operator is the \emph{soft-thresholding} operator, and is defined component-wise as
+\begin{equation}\label{eq:soft_thresholding}
+\left[\text{Prox}_{\mu \norm{\cdot}_1}(x)\right]_j = \left(1 - \frac{\mu}{|x_j|}\right)_+ x_j = 
+\begin{cases}
+x_j - \mu \text{ if } \mu \leq x_j \\
+0 \text{ if } -\mu \leq x_j \leq \mu \\
+\mu - x_j \text{ if }  x_j \leq - \mu \\
+\end{cases}
+\end{equation}
+
+A practical implementation of \SAGA\ relies on a number of non-trivial techniques that need to be used. In this technical report we detail the techniques that we found where essential to obtain a practical implementation of this algorithm. These are:
+\begin{itemize}
+% \item {\bf Adaptive step size}. The SAGA algorithm relies on a particular choice of the step size $\gamma$. While in theory this step size can be estimated from the data, we found that much faster convergence can be achieved by choosing an \emph{adaptive} step size. We will detail this choice in Section~\ref{scs:step_size}.
+\item {\bf Lagged updates}. Even if the gradients $\nabla f_i(x)$ are sparse, the vector $\bar{\alpha}$ is typically dense and so update rule~\eqref{eq:update_rule} involves dense vector operations. However, a technique known as implicit updates, lagged updates~\citep{defazio2014saga} or just-in-time updates~\citep{schmidt2013minimizing} can be used in order to reduce the vector update to sparse operations. 
+We extend this technique to the case of an $\ell_1$ penalty term.
+\item {\bf Step size}. The theory of \SAGA\ is developed for a step-size that is sub-optimal. In particular, 
+\end{itemize}
+
+\section{Impicit updates}
+
+When the vectors $a_i$ are sparse (recall that we assume $f_i$ is of the form $f_i(x) = g(a_i^T x)$, an individual gradient $\nabla f_i$ will inherit the sparsity pattern of the corresponding $a_i$. However, the update rule~\eqref{eq:update_rule} appears unappealing since in general $\bar{\alpha}$ will be dense. Nevertheless, we can use the following technique to obtain iterations with a cost that is proportional to the number of non-zeros in $a_i$.
+
+This technique consists in not explicitly storing the full vector $x_k$ after each iteration. Instead, on each iteration we only compute the elements corresponding to non-zero elements of $a_i$ and at the same time storing a record of when was the last time that a given feature or coordinate was updated. We denote the vector that keeps track of this $m$, such that $m_i$ returns the last iteration in which $x_i$ was updated.
+
+We will first present the technique in its general form and then see how this simplifies for some common choice of the regularizers such as $\ell_2$ or $\ell_1$. The technique can be defined recursively as follows (assumes the prox is computed element-wise):
+
+\begin{enumerate}[(i)]
+\item In the first iteration, perform the update rule only on the support of $a_1$, which we denote $J$, and we updated the vector $m$.
+$$
+\begin{aligned}
+(x^1)_J &\leftarrow \text{Prox}_{\gamma \mu}((1 - \gamma^k \lambda)x_k - \gamma^k (\nabla f_i(x_k) - {\alpha}_i + \bar{\alpha}))_J \\
+m_J &\leftarrow 1
+\end{aligned}
+$$
+\item At iteration $k$, we update the vector of coefficients $x_k$ to ensure that it is up-to-date on the support of $a_k$. That is, for all indices $j$ in the support of $a_i$: 
+\begin{algorithmic}
+\For{$j \text{ in the support of }a_i$}
+\For{$l \gets m_j,k$ }
+\State $x_j \gets \text{Prox}_{\gamma^k \mu}((1 - \gamma^k \lambda)x_j - \gamma^k \bar{\alpha}_j)$
+\EndFor
+\State $m_j \gets k$ \Comment{ Mark the $j$-th variable as updated }
+\EndFor
+\end{algorithmic}
+\item Perform the $k$-th update on the support of $a_i$:
+\begin{algorithmic}
+\For{$j \in \text{ support of }a_i$}
+\State $(x_k)_j \gets \text{Prox}_{\gamma^k \mu}((1 - \gamma^k \lambda)x_k - \gamma^k (\nabla f_i(x_k) - {\alpha}_i + \bar{\alpha}))_j$
+\EndFor
+\end{algorithmic}
+% $$
+% \begin{aligned}
+% (x_k)_j &\leftarrow \text{Prox}_{\gamma \mu}((1 - \gamma \lambda)x_k - \gamma (\nabla f_i(x_k) - {\alpha}_i + \bar{\alpha}))_j \\
+% \alpha_i &\leftarrow \nabla f_i(x_k) (XXX)
+% \end{aligned}
+% $$
+\end{enumerate}
+
+The technique of implicit (or lagged) updates consists in finding a shortcut for the update in step $(ii)$. As we will see, this can be done for the case of $\ell_2$ regularization and (to a certain extend) for the case of $\ell_1$ regularization. For simplicity we define the following function $P$ which represents the update of a single coordinate. Given arbitrary real numbers $s, t$ this is defined as follows:
+$$
+U_t(s) = \text{{Prox}}_{\gamma \mu}((1 - \gamma \lambda)s - \gamma t) \quad,
+$$
+The update in step $(ii)$ can be written in this notation as $x \leftarrow U_{\bar{\alpha_j}}(x_j)$. The for loop in this step can be interpreted as the composition of $U$ with itself. Hence, the efficiency of the lagged update will depend on how fast we are able to compute $U^m$, where the exponent denotes composition with itself.
+
+\subsection{Implicit updates with $\ell_2$ regularization}
+
+We start with the simple case in which there is no non-smooth penalty term, i.e. $\Omega$ is zero. This setting is described in~\citep{defazio2014saga} and in ~\citep{schmidt2013minimizing} (in this case of the \SAG\ algorithm instead of \SAGA).
+
+
+In this case, the updates in step (ii) take a simple form. Supposing $k-m_j = 1$ then the update for coordinate $j$ is simply
+$$
+x^+_j \gets (1 - \gamma \lambda)x_j - \gamma \bar{\alpha}_j \quad.
+$$
+If $k-m_j=2$ then the update becomes
+$$
+\begin{aligned}
+x^+_j &\gets (1 - \gamma^{k} \lambda)((1 - \gamma^{k-1} \lambda)x_j - \gamma^{k-1} \bar{\alpha}_j) - \gamma^k \bar{\alpha}_j \quad. \\
+&= (1 - \gamma^{k} \lambda)(1 - \gamma^{k-1} \lambda) x_j - \gamma^k \bar{\alpha} (1 + (1 - \gamma^{k-1} \lambda))
+\end{aligned}
+$$
+
+From this it is easy to generalize to an arbitrary value of $k-m_j$. The full update in this case becomes:
+\begin{algorithmic}
+\For{$j \in \text{ support of }a_i$}
+\State $x_j \gets \left(\prod_{i=1}^{k-m_j} (1 - \gamma^{k-i+1} \lambda )\right) x_j + \gamma^k \bar{\alpha} \left(1 + \sum_{i=1}^{k-m_j} \prod_{j=1}^i (1 - \gamma^{k-j} \lambda) \right)$
+\State $m_j \gets k$
+\EndFor
+\end{algorithmic}
+
+That this is indeed equivalent to the update rule in in (ii) can be easily proven by induction on $k - m_j$.
+
+
+\subsection{Implicit updates for $\ell_2 + \ell_1$ regularization}
+
+Through this section $\text{Prox}$ denotes the proximal operator for the $\ell_1$ norm, defined in Eq.~\eqref{eq:soft_thresholding}. Our update scheme is based upon the following lemma. 
+
+
+\begin{lemma}\label{lemma:update_l1}
+Let $s, t$ be arbitrary real numbers and $P$ be a function defined as follows:
+where $j$ is an arbitrary index. Let $P^m$ denote the composition of $P$ with itself $m$ times. Then, if $|\bar{\alpha}_j| \leq \mu$ or if $\bar{\alpha}_j x_j \leq 0$, then it is verified that
+$$
+P^m(s, t) = 
+\text{\emph{Prox}}_{m \gamma \mu}\left((1 - \gamma \lambda)^{m} x_j + \gamma \bar{\alpha}_j \sum_{i=1}^{m} (1 - \gamma \lambda)^{i-1}\right)
+$$
+\end{lemma}
+\begin{proof}
+% Take first the case of $k - m_j = 1$. The update in (ii) takes the following form
+% $$
+% x_j \gets \text{Prox}_{\gamma \mu}((1 - \gamma \lambda)x_j - \gamma \bar{\alpha}_j)
+% $$
+We first consider the case in which $\abs{\bar{\alpha}_j} \leq \mu$. Make make the following distinction of cases:
+\begin{itemize}
+\item $x_j = 0$. In this case $P(x_j) = \text{{Prox}}_{\gamma \mu}(- \gamma \bar{\alpha}_j)$ and the assumption $\abs{\bar{\alpha}_j} \leq \mu$ implies that $T(x_j) = \text{{Prox}}_{\gamma \mu}(- \gamma \bar{\alpha}_j) = 0$.
+\end{itemize}
+% and $(1 - \gamma \lambda)x_j - \gamma \bar{\alpha}_j \geq \gamma \mu$
+. Then by the definition of soft-thresholding we have the update
+$$
+T(x) = 
+$$
+XXX
+$$
+x_j^+ \gets (1 - \gamma \lambda)x_j - \gamma \bar{\alpha}_j - \gamma \mu
+$$
+\end{proof}
+
+
+This proximal function also features a homogeneous property, namely that if $x = \tau w$, then 
+$$
+\text{Prox}_\lambda(x) = \tau \text{Prox}_{\lambda /\tau}(w_k) \quad.
+$$
+
+This, together with Lemma~\ref{lemma:update_l1}, yield the following lagged update rule for the $\ell_1$ regularization.
+
+
+
+% \section{Adaptive step size} \label{scs:step_size}
+
+% Following~\citep{schmidt2013minimizing,schmidt2015non}, we take the step size to be $\gamma = 1 / L$, where $L$ is an approximation to the maximum Lipschitz constant of the gradients. This is the smallest number such that
+% $$
+% \norm{\nabla f_i(w) - \nabla f_i(v)} \leq L \norm{w - v}\quad,
+% $$
+% for all $i, w$ and $v$. A classical result on quadratic upper bounds for $L$-smooth functions (see e.g.~\citep[Lemma 1.2.3]{nesterov2004introductory}) states that the following inequality is verified:
+% \begin{equation*}
+% f_{i}(x_k - \frac{1}{L}\nabla f_{i}(x_k)) \leq f_{i}(x_k) - \frac{1}{2 L} \norm{\nabla f_{i}(x_k)}^2
+% \end{equation*}
+% The adaptive step size strategy is the following: at the current iterate, compute the above inequality for the current value of $i$ and $k$. If the inequality is satisfied, use the step size $1 / L$. Otherwise, double the value of $L$ until the inequality is verified.
+
+\subsection{Experiments}
+
+Some convergence plots.
+
+
+\section{Choice of step size}
+
+
+
+
+\section{Feedback}
+
+
+\bibliography{biblio}{}
+\end{document}
